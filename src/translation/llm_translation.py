@@ -7,6 +7,9 @@ import re
 import argparse
 from tqdm import tqdm
 import pandas as pd
+from collections import deque
+from datetime import datetime, timedelta
+import time
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from src.validator.arg_validator import validate_arguments
@@ -24,6 +27,9 @@ class Translator:
         self.base_url = os.getenv("BASE_URL")
         self.api_key = os.getenv("API_KEY")
         self.model = get_model_map().get(model)
+        self.is_free_model = ":free" in self.model
+        self.free_model_max_requests_per_minute = 18
+        self.request_timestamps = deque()
 
     def __enter__(self):
         self.main_dir = os.getcwd()
@@ -36,6 +42,26 @@ class Translator:
 
         return self
 
+    def wait_if_request_limit_reached(self):
+        if not self.is_free_model:
+            return
+
+        current_time = datetime.now()
+        cutoff_time = current_time - timedelta(minutes=1)
+        while self.request_timestamps and self.request_timestamps[0] < cutoff_time:
+            self.request_timestamps.popleft()
+
+        if len(self.request_timestamps) >= self.free_model_max_requests_per_minute:
+            time_to_wait = (self.request_timestamps[0] + timedelta(minutes=1) - current_time).total_seconds()
+            if time_to_wait > 0:
+                logging.info(f"Per minute request limit reached for free model. Waiting for {time_to_wait:.2f} seconds...")
+
+                time.sleep(time_to_wait)
+                self.wait_if_request_limit_reached()
+                return
+
+        self.request_timestamps.append(current_time)
+
     def generate_response_using_llm(self, message_log):
         client = OpenAI(
             base_url=self.base_url,
@@ -47,6 +73,8 @@ class Translator:
         max_attempts = 5
         while max_attempts > 0:
             try:
+                self.wait_if_request_limit_reached()
+
                 response = client.chat.completions.create(
                     model=self.model,
                     messages=message_log,
